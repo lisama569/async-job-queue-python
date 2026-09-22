@@ -7,3 +7,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+queue.db
+queue.db-shm
+queue.db-wal
+*.db
+*.db-shm
+*.db-wal
