@@ -90,3 +90,57 @@ class Delivery:
 class GroupOffset:
     group: str
     offset: int
+
+
+# 组内分发状态（group_jobs.status 的取值）
+class GroupJobStatus(str, Enum):
+    # 尚未投递给该组
+    PENDING = "pending"
+    # 该组有消费者占用中
+    INFLIGHT = "inflight"
+    # 该组内失败、退避等待重投
+    RETRYING = "retrying"
+    # 终态：该组已成功确认
+    SUCCEEDED = "succeeded"
+    # 终态：该组内重试耗尽
+    FAILED = "failed"
+    # 终态：该组判定不可处理
+    REJECTED = "rejected"
+
+
+TERMINAL_GROUP_STATUSES: frozenset[str] = frozenset(
+    {
+        GroupJobStatus.SUCCEEDED.value,
+        GroupJobStatus.FAILED.value,
+        GroupJobStatus.REJECTED.value,
+    }
+)
+
+
+@dataclass
+class GroupProgress:
+    """单个消费者组的进度对账结果。"""
+
+    group: str
+    offset: int
+    total_jobs: int
+    # 各状态 -> 该状态下的任务 id 列表（按入队顺序）
+    buckets: dict[str, list[str]] = field(default_factory=dict)
+
+    def count(self, status: str) -> int:
+        return len(self.buckets.get(status, []))
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return {status: len(ids) for status, ids in self.buckets.items()}
+
+
+@dataclass
+class Checkpoint:
+    """一个组的可持久化进度快照（可落盘为 JSON，供换进程恢复）。"""
+
+    group: str
+    offset: int
+    created_at: float
+    # job_id -> 该组内的终态结论（仅收录终态任务）
+    conclusions: dict[str, str] = field(default_factory=dict)

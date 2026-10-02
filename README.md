@@ -5,8 +5,12 @@
 
 - 任务入队（`dedupe_key` 幂等去重）、投递（claim）、确认（ack / nack）
 - 消费者组：组间相互独立、组内竞争消费；每组建组后可看到历史任务
-- 位点（offset）管理：只能严格前进，回退 / 原地提交 / 越界一律明确拒绝
-- at-least-once 投递 + 占用超时自动回收重投 + 可控指数退避重试
+- 位点（offset）管理：只能严格前进，回退 / 原地提交 / 越界 / 跳过未定论任务
+  一律明确拒绝，位点始终与组内实际处理进度对齐
+- 进度对账：按组导出位点 + 各状态（成功/失败/拒绝/在途/待处理/退避中）任务清单
+- 检查点：组进度可导出为 JSON 快照，重启或换消费进程后据此接着消费，
+  已定论任务不重做、未做完任务不跳过、其它组不受影响
+- at-least-once 投递 + 占用超时自动回收重投 + 可控指数退避重试（退避按组隔离）
 - 同一任务在同一组内同一时刻只能被一个消费者占用
 - 超过重试上限 → `failed` 终态；内容不可处理 → `rejected` 终态；均可查询原因
 - 进程重启后任务、投递与位点全部从 SQLite 恢复，任务不丢失、不重复完成
@@ -17,7 +21,7 @@
 uv sync                                   # 安装依赖（含 pytest / httpx）
 uv run python -m jobqueue.cli demo        # 端到端演示：成功 / 重试耗尽 / 拒绝
 uv run python -m jobqueue.cli serve       # 启动 HTTP 服务（默认 127.0.0.1:8000）
-uv run pytest -q                          # 运行全部测试（36 个，含并发/重启边界）
+uv run pytest -q                          # 运行全部测试（58 个，含并发/重启/检查点边界）
 ```
 
 ## HTTP API
@@ -26,11 +30,14 @@ uv run pytest -q                          # 运行全部测试（36 个，含并
 |--------|-------------------------------|------------------------------------------|
 | POST   | `/jobs`                       | 入队，body：`{"payload": {...}, "dedupe_key": "可选"}` |
 | GET    | `/jobs?state=failed`          | 列出任务，可按状态过滤                   |
-| GET    | `/jobs/{id}`                  | 查询任务（含 `last_error` 与投递历史）   |
+| GET    | `/jobs/{id}`                  | 查询任务（含 `last_error`、投递历史、各组结论 `groups`）|
 | POST   | `/groups`                     | 注册消费者组 `{"group": "g1"}`（claim 时也会自动注册）|
 | GET    | `/groups`                     | 列出消费者组                             |
 | GET    | `/groups/{g}/offset`          | 查询位点                                 |
 | POST   | `/groups/{g}/offset`          | 提交位点 `{"offset": n}`                 |
+| GET    | `/groups/{g}/progress`        | 进度对账：位点 + 各状态任务计数与清单    |
+| POST   | `/groups/{g}/checkpoint`      | 导出检查点 `{"path": "可选落盘路径"}`    |
+| POST   | `/checkpoints/restore`        | 恢复检查点 `{"path", "group": "可选改名"}`|
 | POST   | `/claim`                      | 占用一条 `{"group","consumer","visibility_timeout"?}` |
 | POST   | `/deliveries/{id}/ack`        | 确认成功 `{"consumer"}`                  |
 | POST   | `/deliveries/{id}/nack`       | 否定确认 `{"consumer","reason","reject"?}`|
@@ -65,6 +72,12 @@ curl -s -XPOST localhost:8000/deliveries/1/ack -H 'content-type: application/jso
   不影响 B 组消费；`jobs.state` 是所有组分发状态的汇总视图
   （有 inflight → inflight；有 retrying → retrying；全终态时 succeeded 优先于
   rejected 优先于 failed）。
+- **终态不被改回**：某组对任务一旦得出终态结论（succeeded / failed / rejected），
+  其它组的投递、确认、重试都只写自己的账本，不会把该组的结论改回在途或待处理。
+- **退避按组隔离**：失败后的退避等待时间记录在 `group_jobs.available_at`（组级），
+  A 组退避只挡住 A 组自己对该任务的投递，B 组照常取件、按自己的节奏推进。
+- **按组查询结论**：`GET /jobs/{id}` 的 `groups` 字段（或库接口
+  `queue.job_group_statuses(job_id)`）给出该任务在每个组内的处理结论。
 - **组内唯一占用**：`group_jobs.delivery_id` 非空即表示被占用，claim 在单个
   `BEGIN IMMEDIATE` 事务内完成「回收超时 → 选取 → 建投递 → 占用」，多线程并发下
   同一任务也只会被一个消费者拿到。
@@ -104,12 +117,56 @@ curl -s -XPOST localhost:8000/deliveries/1/ack -H 'content-type: application/jso
 
 - 位点是**组级游标**，表示"已处理到第几条"（从 0 开始），与投递确认相互独立：
   位点是游标记账，ack 是投递语义，二者互不自动推进。
-- 提交位点必须满足：`new_offset > current_offset`（严格前进；原地提交与回退返回
-  `409 offset_rollback`），且 `new_offset <= 任务总数`（越界返回
-  `409 offset_out_of_range`）；对不存在的组提交返回 `404 group_not_found`。
+- 提交位点必须满足以下全部条件，任一不满足即明确拒绝、位点不变：
+  1. `new_offset > current_offset`——严格前进，原地提交与回退返回
+     `409 offset_rollback`；
+  2. `new_offset <= 任务总数`——越界返回 `409 offset_out_of_range`；
+  3. 按入队顺序的前 `new_offset` 条任务在**该组内**必须全部已有终态结论
+     （succeeded / failed / rejected）——跳过仍在途、退避中或尚未投递的任务
+     返回 `409 offset_gap`，错误信息会指认未定论的任务 id。
+  对不存在的组提交返回 `404 group_not_found`。
 - 位点提交在 `BEGIN IMMEDIATE` 事务内做比较与更新，并发提交不会使位点回退。
 - 组是惰性可见的：新注册（或首次 claim）的组通过 `group_jobs` 懒补齐看到建组之前
   已存在的任务。
+
+## 进度对账与检查点
+
+### 进度对账（reconciliation）
+
+`GET /groups/{g}/progress`（库接口 `queue.group_progress(g)`）导出某组当前的对账结果：
+
+```json
+{
+  "group": "g", "offset": 2, "total_jobs": 4,
+  "counts": {"pending": 1, "inflight": 1, "retrying": 0,
+             "succeeded": 1, "failed": 0, "rejected": 1},
+  "jobs":  {"succeeded": ["<id1>"], "rejected": ["<id2>"], ...}
+}
+```
+
+- 每个状态桶给出**任务 id 清单**（按入队顺序），运维可逐条对账；
+- 由于位点提交受 `offset_gap` 约束，位点 ≤ 已定论任务数恒成立，
+  不会出现"位点显示处理到后面、前面其实还有没结果的任务"。
+
+### 检查点（checkpoint）
+
+- **导出**：`POST /groups/{g}/checkpoint`（库接口
+  `queue.export_checkpoint(g, path)`）把该组当前对账结果固化为一份自描述的
+  JSON 快照（位点 + 该组所有终态结论），给定 `path` 时原子落盘
+  （先写临时文件再改名）。
+- **恢复**：`POST /checkpoints/restore`（库接口
+  `queue.restore_checkpoint(path_or_cp, group=None)`）把快照应用到目标组
+  （默认快照原组名，可改名，用于换消费进程接管）：
+  - 快照中的终态结论写入目标组账本——已定论任务**不会再被投递执行**；
+  - 快照未收录的任务保持 pending——**不会被跳过**，照常按序投递；
+  - 只写目标组的账本，**其它组的进度不受影响**；
+  - 位点只前进不回退：取当前位点与快照位点的较大者；
+  - 目标组已有**不同**终态结论时整体拒绝（`409 checkpoint_conflict`，不落任何
+    修改）；快照文件损坏、格式不符或引用了队列中不存在的任务时返回
+    `400 checkpoint_invalid`；
+  - 恢复是幂等的：同一快照重复恢复结果一致。
+- 恢复后原有的至少一次投递、占用超时重投语义不变：快照只标记"已定论"，
+  在途 / 待处理任务仍走正常的 claim → ack/nack → 超时回收流程。
 
 ## 错误码速查
 
@@ -122,6 +179,9 @@ curl -s -XPOST localhost:8000/deliveries/1/ack -H 'content-type: application/jso
 | `delivery_expired`           | 409  | 占用已超时，投递已被回收                 |
 | `offset_rollback`            | 409  | 位点回退或原地提交                       |
 | `offset_out_of_range`        | 409  | 位点越过任务总数                         |
+| `offset_gap`                 | 409  | 位点跳过该组尚未定论（在途/退避/未投递）的任务 |
+| `checkpoint_invalid`         | 400  | 检查点文件损坏、格式不符或引用未知任务   |
+| `checkpoint_conflict`        | 409  | 检查点与目标组现有终态结论冲突           |
 | `unprocessable_job`          | 422  | 任务内容不可处理（worker 层 RejectJob）  |
 | `job_not_found` / `delivery_not_found` / `group_not_found` | 404 | 资源不存在 |
 | `empty_queue`                | 204  | claim 时组内暂无可投递任务               |
@@ -142,6 +202,20 @@ curl -s -XPOST localhost:8000/deliveries/1/ack -H 'content-type: application/jso
 
 存储层固定开启 `PRAGMA journal_mode=WAL`、`busy_timeout=5000`，所有写操作在进程内
 互斥锁 + 立即事务中执行，保证崩溃时 WAL 检查点恢复与并发写入不撕裂。
+
+## 兼容范围
+
+- **旧库自动迁移**：早期版本创建的 SQLite 文件打开时幂等补列
+  （`group_jobs.status / attempts / available_at`），并按旧字段回填，
+  任务、投递与位点不丢失。
+- **行为收紧（需知晓）**：位点提交新增 `offset_gap` 校验——目标位点覆盖的任务
+  在该组内必须全部已有终态结论。此前允许"先记账后处理"的调用方需要改为
+  先确认处理结论、再提交位点。
+- **退避语义修正**：失败退避由全局（`jobs.available_at`）改为组级
+  （`group_jobs.available_at`），某组退避不再拖住其它组；`jobs.available_at`
+  仍维护为各组未终结账本的最小值，仅作汇总展示。
+- 检查点快照为自描述 JSON（`format=jobqueue-checkpoint, version=1`），
+  可跨进程、跨机器搬运；恢复目标必须是包含快照所引任务的同一队列数据。
 
 ## 在代码中作为库使用
 
@@ -170,6 +244,12 @@ Worker(queue, "emails", "worker-1", send_email).run()
 - 占用、重复 ack、越权 ack、超时 ack 与重投（`tests/test_delivery.py`）
 - 退避等待、重试上限、failed/rejected 原因可区分（`tests/test_retry.py`）
 - 组间独立、新组看历史、位点回退 / 越界 / 未知组拒绝（`tests/test_groups.py`）
+- 进度对账分桶、位点跳过在途/退避/未投递任务的 `offset_gap` 拒绝
+  （`tests/test_reconcile.py`）
+- 组间隔离：终态不被其它组改回、退避互不牵连、按组查看任务结论
+  （`tests/test_isolation.py`）
+- 检查点导出 / 落盘 / 恢复：重启接着消费、换组接管、冲突与非法快照拒绝、
+  位点只前进、幂等恢复（`tests/test_checkpoint.py`）
 - 进程重启恢复、崩溃后超时重投、终态不复活（`tests/test_restart.py`）
 - 8 消费者并发 claim 每任务仅一次、4 worker 并发含永久失败、位点并发竞争
   （`tests/test_concurrency.py`）

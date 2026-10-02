@@ -10,10 +10,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
+from jobqueue.checkpoint import (
+    load_checkpoint_file,
+    save_checkpoint_file,
+)
 from jobqueue.config import Settings
 from jobqueue.errors import ErrorCode, QueueError
-from jobqueue.models import Delivery, GroupOffset, Job
+from jobqueue.models import (
+    Checkpoint,
+    Delivery,
+    GroupOffset,
+    GroupProgress,
+    Job,
+)
 from jobqueue.store import JobStore
 
 
@@ -82,6 +93,38 @@ class JobQueue:
 
     def get_offset(self, group: str) -> GroupOffset | None:
         return self.store.get_offset(group)
+
+    # ---------- 进度对账 ----------
+
+    def group_progress(self, group: str) -> GroupProgress:
+        """导出某组的进度对账结果（位点 + 各状态任务清单）。"""
+        return self.store.group_progress(group)
+
+    def job_group_statuses(self, job_id: str) -> dict[str, str]:
+        """一个任务在各消费者组内的处理结论。"""
+        return self.store.job_group_statuses(job_id)
+
+    # ---------- 检查点 ----------
+
+    def export_checkpoint(
+        self, group: str, path: str | Path | None = None
+    ) -> Checkpoint:
+        """导出某组的进度快照；给定 path 时同时持久化为 JSON 文件。"""
+        cp = self.store.export_checkpoint(group)
+        if path is not None:
+            save_checkpoint_file(cp, path)
+        return cp
+
+    def restore_checkpoint(
+        self, source: str | Path | Checkpoint, group: str | None = None
+    ) -> GroupOffset:
+        """从快照（文件路径或 Checkpoint 对象）恢复某组进度。"""
+        cp = (
+            load_checkpoint_file(source)
+            if isinstance(source, (str, Path))
+            else source
+        )
+        return self.store.restore_checkpoint(cp, group)
 
     def close(self) -> None:
         if self._owns_store:

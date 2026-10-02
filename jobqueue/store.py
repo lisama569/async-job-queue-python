@@ -16,7 +16,15 @@ from typing import Any
 
 from jobqueue.config import Settings
 from jobqueue.errors import ErrorCode, QueueError
-from jobqueue.models import Delivery, GroupOffset, Job, JobState
+from jobqueue.models import (
+    TERMINAL_GROUP_STATUSES,
+    Checkpoint,
+    Delivery,
+    GroupOffset,
+    GroupProgress,
+    Job,
+    JobState,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -41,6 +49,7 @@ CREATE TABLE IF NOT EXISTS group_jobs (
     delivery_id INTEGER,
     status      TEXT NOT NULL DEFAULT 'pending',
     attempts    INTEGER NOT NULL DEFAULT 0,
+    available_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY ("group", job_id)
 );
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -101,6 +110,16 @@ class JobStore:
                 "UPDATE group_jobs SET attempts=COALESCE("
                 "(SELECT attempts FROM jobs WHERE jobs.id=group_jobs.job_id), 0)"
             )
+        if "available_at" not in cols:
+            # 旧库退避时间挂在 jobs 上（全局），回填为每组各自的退避起点
+            self._conn.execute(
+                "ALTER TABLE group_jobs ADD COLUMN available_at REAL NOT NULL DEFAULT 0"
+            )
+            self._conn.execute(
+                "UPDATE group_jobs SET available_at=COALESCE("
+                "(SELECT available_at FROM jobs WHERE jobs.id=group_jobs.job_id), 0) "
+                "WHERE status IN ('pending','retrying','inflight')"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -144,8 +163,11 @@ class JobStore:
         conn.execute(
             "UPDATE jobs SET state=?, attempts=COALESCE(("
             "SELECT MAX(attempts) FROM group_jobs WHERE job_id=?), 0), "
+            "available_at=COALESCE(("
+            "SELECT MIN(available_at) FROM group_jobs WHERE job_id=? "
+            "AND status IN ('pending','retrying','inflight')), 0), "
             "updated_at=? WHERE id=?",
-            (state, job_id, now, job_id),
+            (state, job_id, job_id, now, job_id),
         )
 
     def _row_to_job(self, row: sqlite3.Row) -> Job:
@@ -222,6 +244,16 @@ class JobStore:
 
     # ---------- 占用 / 回收 / 投递 ----------
 
+    def _backfill_group_jobs(self, conn: sqlite3.Connection, group: str) -> None:
+        """懒补齐 group_jobs：新组也能看到建组之前的任务。"""
+        conn.execute(
+            "INSERT INTO group_jobs (\"group\", job_id, delivery_id, status) "
+            "SELECT ?, j.id, NULL, 'pending' FROM jobs j "
+            "WHERE NOT EXISTS (SELECT 1 FROM group_jobs gj "
+            "WHERE gj.\"group\"=? AND gj.job_id=j.id)",
+            (group, group),
+        )
+
     def _reclaim_expired(
         self, conn: sqlite3.Connection, group: str, now: float
     ) -> None:
@@ -248,14 +280,13 @@ class JobStore:
                 "UPDATE deliveries SET state='timed_out' WHERE id=?", (row["d_id"],)
             )
             conn.execute(
-                "UPDATE group_jobs SET delivery_id=NULL, status=? "
+                "UPDATE group_jobs SET delivery_id=NULL, status=?, available_at=? "
                 "WHERE \"group\"=? AND job_id=?",
-                (new_state, group, row["job_id"]),
+                (new_state, available_at, group, row["job_id"]),
             )
             conn.execute(
-                "UPDATE jobs SET available_at=?, last_error=?, updated_at=? "
-                "WHERE id=?",
-                (available_at, error, now, row["job_id"]),
+                "UPDATE jobs SET last_error=?, updated_at=? WHERE id=?",
+                (error, now, row["job_id"]),
             )
             self._rollup_job(conn, row["job_id"], now)
 
@@ -287,19 +318,13 @@ class JobStore:
                 )
                 self._reclaim_expired(conn, group, now)
                 # 懒补齐 group_jobs：新组也能看到建组之前的任务
-                conn.execute(
-                    "INSERT INTO group_jobs (\"group\", job_id, delivery_id, status) "
-                    "SELECT ?, j.id, NULL, 'pending' FROM jobs j "
-                    "WHERE NOT EXISTS (SELECT 1 FROM group_jobs gj "
-                    "WHERE gj.\"group\"=? AND gj.job_id=j.id)",
-                    (group, group),
-                )
+                self._backfill_group_jobs(conn, group)
                 row = conn.execute(
                     "SELECT j.*, gj.status AS g_status "
                     "FROM jobs j JOIN group_jobs gj "
                     "ON gj.job_id=j.id AND gj.\"group\"=? "
                     "WHERE gj.status IN ('pending','retrying') "
-                    "AND j.available_at<=? AND gj.delivery_id IS NULL "
+                    "AND gj.available_at<=? AND gj.delivery_id IS NULL "
                     "ORDER BY j.created_at, j.rowid LIMIT 1",
                     (group, now),
                 ).fetchone()
@@ -435,14 +460,13 @@ class JobStore:
                     "UPDATE deliveries SET state='nacked' WHERE id=?", (delivery_id,)
                 )
                 conn.execute(
-                    "UPDATE group_jobs SET delivery_id=NULL, status=? "
+                    "UPDATE group_jobs SET delivery_id=NULL, status=?, available_at=? "
                     "WHERE \"group\"=? AND job_id=?",
-                    (new_state, row["group"], row["job_id"]),
+                    (new_state, available_at, row["group"], row["job_id"]),
                 )
                 conn.execute(
-                    "UPDATE jobs SET available_at=?, last_error=?, updated_at=? "
-                    "WHERE id=?",
-                    (available_at, error, now, row["job_id"]),
+                    "UPDATE jobs SET last_error=?, updated_at=? WHERE id=?",
+                    (error, now, row["job_id"]),
                 )
                 self._rollup_job(conn, row["job_id"], now)
                 conn.execute("COMMIT")
@@ -544,6 +568,27 @@ class JobStore:
                         f"位点越界：队列中仅有 {total} 条任务，"
                         f"拒绝提交 {new_offset}",
                     )
+                # 位点必须与该组实际处理进度对齐：前 new_offset 条任务
+                # （按入队顺序）在该组内必须全部已有终态结论，
+                # 不允许跳过仍在途 / 未投递 / 退避中的任务
+                self._backfill_group_jobs(conn, group)
+                undecided = [
+                    r["id"]
+                    for r in conn.execute(
+                        "SELECT j.id AS id, gj.status AS st FROM jobs j "
+                        "JOIN group_jobs gj ON gj.job_id=j.id AND gj.\"group\"=? "
+                        "ORDER BY j.created_at, j.rowid LIMIT ?",
+                        (group, new_offset),
+                    ).fetchall()
+                    if r["st"] not in TERMINAL_GROUP_STATUSES
+                ]
+                if undecided:
+                    raise QueueError(
+                        ErrorCode.OFFSET_GAP,
+                        f"位点跳过未定论任务：组 {group!r} 在前 {new_offset} 条中"
+                        f"仍有 {len(undecided)} 条没有终态结论"
+                        f"（如 {undecided[:3]}），拒绝提交 {new_offset}",
+                    )
                 conn.execute(
                     "UPDATE groups SET \"offset\"=? WHERE name=?",
                     (new_offset, group),
@@ -553,5 +598,178 @@ class JobStore:
                 self._conn.execute("ROLLBACK")
                 raise
         result = self.get_offset(group)
+        assert result is not None
+        return result
+
+    # ---------- 进度对账 ----------
+
+    def group_progress(self, group: str) -> GroupProgress:
+        """导出某个消费者组的进度对账结果。
+
+        返回该组位点，以及 pending / inflight / retrying / succeeded /
+        failed / rejected 各桶的任务 id 列表（按入队顺序）。
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn = self._conn
+                row = conn.execute(
+                    "SELECT \"offset\" FROM groups WHERE name=?", (group,)
+                ).fetchone()
+                if row is None:
+                    raise QueueError(
+                        ErrorCode.GROUP_NOT_FOUND,
+                        f"消费者组 {group!r} 不存在，请先注册",
+                    )
+                offset = row["offset"]
+                # 对账前补齐账本，保证建组前的历史任务也计入
+                self._backfill_group_jobs(conn, group)
+                rows = conn.execute(
+                    "SELECT j.id AS id, gj.status AS st FROM jobs j "
+                    "JOIN group_jobs gj ON gj.job_id=j.id AND gj.\"group\"=? "
+                    "ORDER BY j.created_at, j.rowid",
+                    (group,),
+                ).fetchall()
+                conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        buckets: dict[str, list[str]] = {
+            "pending": [],
+            "inflight": [],
+            "retrying": [],
+            "succeeded": [],
+            "failed": [],
+            "rejected": [],
+        }
+        for r in rows:
+            buckets.setdefault(r["st"], []).append(r["id"])
+        return GroupProgress(
+            group=group,
+            offset=offset,
+            total_jobs=len(rows),
+            buckets=buckets,
+        )
+
+    def job_group_statuses(self, job_id: str) -> dict[str, str]:
+        """查询一个任务在各个消费者组内的处理结论（组名 -> 组内状态）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT \"group\" AS g, status AS st FROM group_jobs "
+                "WHERE job_id=? ORDER BY \"group\"",
+                (job_id,),
+            ).fetchall()
+        return {r["g"]: r["st"] for r in rows}
+
+    # ---------- 检查点（进度快照） ----------
+
+    def export_checkpoint(self, group: str) -> Checkpoint:
+        """导出某组当前的进度快照：位点 + 该组内所有终态结论。"""
+        progress = self.group_progress(group)
+        conclusions: dict[str, str] = {}
+        for status in sorted(TERMINAL_GROUP_STATUSES):
+            for job_id in progress.buckets.get(status, []):
+                conclusions[job_id] = status
+        return Checkpoint(
+            group=group,
+            offset=progress.offset,
+            created_at=self._now(),
+            conclusions=conclusions,
+        )
+
+    def restore_checkpoint(
+        self, checkpoint: Checkpoint, group: str | None = None
+    ) -> GroupOffset:
+        """把快照恢复到指定组（默认快照原组名），供重启/换进程后接着消费。
+
+        - 快照中的终态结论写入目标组：已定论任务不会再被投递；
+        - 快照未收录的任务保持 pending，不会被跳过；
+        - 目标组已有不同终态结论时拒绝（checkpoint_conflict），不覆盖；
+        - 位点只前进不回退：取当前位点与快照位点的较大者；
+        - 只写目标组的账本，其它组不受影响。
+        """
+        target = group or checkpoint.group
+        if not target:
+            raise QueueError(ErrorCode.INVALID_PAYLOAD, "检查点恢复目标组不能为空")
+        for job_id, status in checkpoint.conclusions.items():
+            if status not in TERMINAL_GROUP_STATUSES:
+                raise QueueError(
+                    ErrorCode.CHECKPOINT_INVALID,
+                    f"检查点含非终态结论：job={job_id} status={status!r}",
+                )
+        now = self._now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn = self._conn
+                conn.execute(
+                    "INSERT INTO groups (name, \"offset\") VALUES (?,0) "
+                    "ON CONFLICT(name) DO NOTHING",
+                    (target,),
+                )
+                unknown = [
+                    job_id
+                    for job_id in checkpoint.conclusions
+                    if conn.execute(
+                        "SELECT 1 FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                    is None
+                ]
+                if unknown:
+                    raise QueueError(
+                        ErrorCode.CHECKPOINT_INVALID,
+                        f"检查点引用了队列中不存在的任务：{unknown[:3]}"
+                        f"（共 {len(unknown)} 条）",
+                    )
+                conflicts: list[str] = []
+                changed: list[str] = []
+                for job_id, status in checkpoint.conclusions.items():
+                    row = conn.execute(
+                        "SELECT status FROM group_jobs "
+                        "WHERE \"group\"=? AND job_id=?",
+                        (target, job_id),
+                    ).fetchone()
+                    if row is None:
+                        conn.execute(
+                            "INSERT INTO group_jobs "
+                            "(\"group\", job_id, delivery_id, status) "
+                            "VALUES (?,?,NULL,?)",
+                            (target, job_id, status),
+                        )
+                        changed.append(job_id)
+                    elif row["status"] in TERMINAL_GROUP_STATUSES:
+                        if row["status"] != status:
+                            conflicts.append(
+                                f"{job_id}: 现有={row['status']} 快照={status}"
+                            )
+                    else:
+                        conn.execute(
+                            "UPDATE group_jobs SET delivery_id=NULL, status=?, "
+                            "available_at=0 WHERE \"group\"=? AND job_id=?",
+                            (status, target, job_id),
+                        )
+                        changed.append(job_id)
+                if conflicts:
+                    raise QueueError(
+                        ErrorCode.CHECKPOINT_CONFLICT,
+                        f"检查点与组 {target!r} 现有终态结论冲突：{conflicts[:3]}"
+                        f"（共 {len(conflicts)} 条），未做任何修改",
+                    )
+                for job_id in changed:
+                    self._rollup_job(conn, job_id, now)
+                # 位点只前进不回退
+                row = conn.execute(
+                    "SELECT \"offset\" FROM groups WHERE name=?", (target,)
+                ).fetchone()
+                new_offset = max(row["offset"], checkpoint.offset)
+                conn.execute(
+                    "UPDATE groups SET \"offset\"=? WHERE name=?",
+                    (new_offset, target),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        result = self.get_offset(target)
         assert result is not None
         return result

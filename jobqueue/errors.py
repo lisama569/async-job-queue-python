@@ -17,8 +17,11 @@ class ErrorCode(str, Enum):
     UNPROCESSABLE_JOB = "unprocessable_job"
     OFFSET_ROLLBACK = "offset_rollback"
     OFFSET_OUT_OF_RANGE = "offset_out_of_range"
+    OFFSET_GAP = "offset_gap"
     GROUP_NOT_FOUND = "group_not_found"
     JOB_NOT_FOUND = "job_not_found"
+    CHECKPOINT_INVALID = "checkpoint_invalid"
+    CHECKPOINT_CONFLICT = "checkpoint_conflict"
 
 
 class QueueError(Exception):

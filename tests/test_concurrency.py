@@ -114,6 +114,10 @@ def test_concurrent_offset_commits_never_regress(settings, queue) -> None:
     queue.create_group("g")
     for i in range(20):
         queue.enqueue({"i": i})
+    # 位点推进以组内终态为前提：先把 20 条全部消费到 succeeded
+    for _ in range(20):
+        d = queue.claim("g", "setup")
+        queue.ack(d.id, "setup")
 
     errors: list[str] = []
     lock = threading.Lock()

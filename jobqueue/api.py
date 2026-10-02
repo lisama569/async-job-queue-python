@@ -43,6 +43,9 @@ _STATUS: dict[ErrorCode, int] = {
     ErrorCode.UNPROCESSABLE_JOB: 422,
     ErrorCode.OFFSET_ROLLBACK: 409,
     ErrorCode.OFFSET_OUT_OF_RANGE: 409,
+    ErrorCode.OFFSET_GAP: 409,
+    ErrorCode.CHECKPOINT_INVALID: 400,
+    ErrorCode.CHECKPOINT_CONFLICT: 409,
 }
 
 
@@ -73,6 +76,15 @@ class NackBody(BaseModel):
     consumer: str = Field(min_length=1)
     reason: str = Field(min_length=1)
     reject: bool = False
+
+
+class CheckpointExportBody(BaseModel):
+    path: str | None = None
+
+
+class CheckpointRestoreBody(BaseModel):
+    path: str = Field(min_length=1)
+    group: str | None = None
 
 
 def _job_dict(job: Job) -> dict[str, Any]:
@@ -138,6 +150,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             **_job_dict(job),
             "deliveries": [_delivery_dict(d) for d in deliveries],
+            "groups": app.state.queue.job_group_statuses(job_id),
         }
 
     @app.post("/groups", status_code=201)
@@ -161,6 +174,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/groups/{group}/offset")
     def commit_offset(group: str, body: OffsetBody) -> dict[str, Any]:
         offset = app.state.queue.commit_offset(group, body.offset)
+        return {"group": offset.group, "offset": offset.offset}
+
+    @app.get("/groups/{group}/progress")
+    def group_progress(group: str) -> dict[str, Any]:
+        progress = app.state.queue.group_progress(group)
+        return {
+            "group": progress.group,
+            "offset": progress.offset,
+            "total_jobs": progress.total_jobs,
+            "counts": progress.counts,
+            "jobs": progress.buckets,
+        }
+
+    @app.post("/groups/{group}/checkpoint", status_code=201)
+    def export_checkpoint(group: str, body: CheckpointExportBody) -> dict[str, Any]:
+        cp = app.state.queue.export_checkpoint(group, body.path)
+        return {
+            "group": cp.group,
+            "offset": cp.offset,
+            "created_at": cp.created_at,
+            "conclusions": cp.conclusions,
+            "path": body.path,
+        }
+
+    @app.post("/checkpoints/restore")
+    def restore_checkpoint(body: CheckpointRestoreBody) -> dict[str, Any]:
+        offset = app.state.queue.restore_checkpoint(body.path, body.group)
         return {"group": offset.group, "offset": offset.offset}
 
     @app.post("/claim")

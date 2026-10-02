@@ -42,6 +42,10 @@ def test_commit_offset_must_advance(queue) -> None:
     queue.create_group("g")
     for i in range(3):
         queue.enqueue({"i": i})
+    # 新语义：位点必须与组内实际处理进度对齐，先把前两条消费到终态
+    for _ in range(2):
+        d = queue.claim("g", "c")
+        queue.ack(d.id, "c")
     queue.commit_offset("g", 1)
     queue.commit_offset("g", 2)
     logger.info("[输入] 位点 2 -> 2（原地）与 2 -> 1（回退）[判定] 均返回 offset_rollback")

@@ -18,10 +18,11 @@ def test_pending_and_offset_survive_restart(settings, tmp_path) -> None:
     q1.create_group("g")
     j1 = q1.enqueue({"n": 1})
     j2 = q1.enqueue({"n": 2})
-    q1.claim("g", "c1")  # j1 占用中
+    d1 = q1.claim("g", "c1")
+    q1.ack(d1.id, "c1")  # j1 在组 g 内已定论，位点才能推进到 1
     q1.commit_offset("g", 1)
     logger.info(
-        "[输入] 进程重启前：j1 inflight、j2 pending、offset=1 [判定] 重开 JobQueue 后全部恢复"
+        "[输入] 进程重启前：j1 succeeded、j2 pending、offset=1 [判定] 重开 JobQueue 后全部恢复"
     )
     q1.close()
 
@@ -29,7 +30,7 @@ def test_pending_and_offset_survive_restart(settings, tmp_path) -> None:
     assert q2.get_offset("g").offset == 1
     assert q2.get_job(j2.id).state is JobState.PENDING
     assert q2.list_jobs() == [q2.get_job(j1.id), q2.get_job(j2.id)]
-    assert q2.get_job(j1.id).state is JobState.INFLIGHT
+    assert q2.get_job(j1.id).state is JobState.SUCCEEDED
     q2.close()
 
 

@@ -52,3 +52,43 @@ def test_open_legacy_schema_and_continue(settings, tmp_path) -> None:
     q.ack(d.id, "c")
     assert q.get_job(j2.id).state is JobState.SUCCEEDED
     q.close()
+
+
+def test_open_schema_without_group_available_at(settings, tmp_path) -> None:
+    """中期 schema（group_jobs 有 status/attempts、无 available_at）打开时自动补列。"""
+    db = str(tmp_path / "mid.db")
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, dedupe_key TEXT UNIQUE, payload TEXT NOT NULL,
+            state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL, available_at REAL NOT NULL,
+            last_error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+        CREATE TABLE groups (name TEXT PRIMARY KEY, "offset" INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE group_jobs (
+            "group" TEXT NOT NULL, job_id TEXT NOT NULL, delivery_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY ("group", job_id));
+        CREATE TABLE deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, "group" TEXT NOT NULL,
+            job_id TEXT NOT NULL, consumer TEXT NOT NULL, attempt INTEGER NOT NULL,
+            delivered_at REAL NOT NULL, visible_after REAL NOT NULL, state TEXT NOT NULL);
+        INSERT INTO groups VALUES ('g', 0);
+        INSERT INTO jobs VALUES ('j1',NULL,'{}','retrying',1,3,0,NULL,0,0);
+        INSERT INTO group_jobs VALUES ('g','j1',NULL,'retrying',1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    logger.info(
+        "[输入] 打开缺 available_at 列的中期表结构 [判定] 自动补列，退避中的任务可继续投递"
+    )
+    q = JobQueue(Settings(db_path=db, base_backoff=0.0))
+    p = q.group_progress("g")
+    assert p.buckets["retrying"] == ["j1"]
+    d = q.claim("g", "c")
+    assert d is not None and d.job_id == "j1" and d.attempt == 2
+    q.close()
