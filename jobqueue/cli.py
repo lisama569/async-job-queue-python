@@ -60,6 +60,27 @@ def run_demo(settings: Settings) -> None:
         fresh = queue.get_job(j.id)
         print(f"- {j.dedupe_key}: state={fresh.state.value} attempts={fresh.attempts} "
               f"last_error={fresh.last_error}")
+
+    # 进度对账：全部任务在 demo 组已有最终结论，安全位点=3
+    progress = queue.group_progress("demo")
+    print("=== demo 组进度对账 ===")
+    print(
+        f"- offset={progress.offset} safe_offset={progress.safe_offset} "
+        f"total={progress.total}"
+    )
+    print(
+        f"- succeeded={len(progress.succeeded)} failed={len(progress.failed)} "
+        f"rejected={len(progress.rejected)} inflight={len(progress.inflight)} "
+        f"retrying={len(progress.retrying)} pending={len(progress.pending)}"
+    )
+
+    # 检查点：导出到临时文件，展示可据此恢复（同库幂等）
+    ckpt_path = os.path.join(os.path.dirname(settings.db_path), "demo-checkpoint.json")
+    queue.save_checkpoint("demo", ckpt_path)
+    restored = queue.load_and_restore_checkpoint(ckpt_path)
+    print("=== 检查点 ===")
+    print(f"- 已导出快照：{ckpt_path}")
+    print(f"- 恢复后 safe_offset={restored.safe_offset}，已定论任务不会再次投递")
     queue.close()
 
 

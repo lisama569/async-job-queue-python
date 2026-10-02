@@ -17,8 +17,12 @@ class ErrorCode(str, Enum):
     UNPROCESSABLE_JOB = "unprocessable_job"
     OFFSET_ROLLBACK = "offset_rollback"
     OFFSET_OUT_OF_RANGE = "offset_out_of_range"
+    # 位点试图越过本组仍在途 / 未投递（未定论）的任务
+    OFFSET_GAP = "offset_gap"
     GROUP_NOT_FOUND = "group_not_found"
     JOB_NOT_FOUND = "job_not_found"
+    # 检查点快照文件损坏 / 字段缺失 / 版本不兼容
+    CHECKPOINT_INVALID = "checkpoint_invalid"
 
 
 class QueueError(Exception):

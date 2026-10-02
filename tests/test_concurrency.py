@@ -115,6 +115,28 @@ def test_concurrent_offset_commits_never_regress(settings, queue) -> None:
     for i in range(20):
         queue.enqueue({"i": i})
 
+    # 先并发把 20 条全部 ack 成定论，位点才有资格推进到 20
+    ack_errors: list[str] = []
+    ack_barrier = threading.Barrier(8)
+
+    def ack_loop() -> None:
+        ack_barrier.wait()
+        for _ in range(20):
+            d = queue.claim("g", threading.current_thread().name)
+            if d is None:
+                return
+            try:
+                queue.ack(d.id, threading.current_thread().name)
+            except Exception as exc:  # noqa: BLE001
+                ack_errors.append(str(exc))
+
+    workers = [threading.Thread(target=ack_loop, name=f"c{i}") for i in range(8)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    assert not ack_errors
+
     errors: list[str] = []
     lock = threading.Lock()
 

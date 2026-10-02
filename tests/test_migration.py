@@ -52,3 +52,50 @@ def test_open_legacy_schema_and_continue(settings, tmp_path) -> None:
     q.ack(d.id, "c")
     assert q.get_job(j2.id).state is JobState.SUCCEEDED
     q.close()
+
+
+def test_legacy_backoff_backfilled_per_group(settings, tmp_path) -> None:
+    """旧库退避只存在 jobs.available_at：打开后回填到每组 available_at，退避按组独立。"""
+    import time
+
+    db = str(tmp_path / "legacy2.db")
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, dedupe_key TEXT UNIQUE, payload TEXT NOT NULL,
+            state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL, available_at REAL NOT NULL,
+            last_error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+        CREATE TABLE groups (name TEXT PRIMARY KEY, "offset" INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE group_jobs (
+            "group" TEXT NOT NULL, job_id TEXT NOT NULL, delivery_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY ("group", job_id));
+        CREATE TABLE deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, "group" TEXT NOT NULL,
+            job_id TEXT NOT NULL, consumer TEXT NOT NULL, attempt INTEGER NOT NULL,
+            delivered_at REAL NOT NULL, visible_after REAL NOT NULL, state TEXT NOT NULL);
+        INSERT INTO groups VALUES ('a',0);
+        """
+    )
+    future = time.time() + 3600
+    conn.execute(
+        "INSERT INTO jobs VALUES ('j1',NULL,'{}','retrying',1,3,?,NULL,0,0)",
+        (future,),
+    )
+    conn.execute(
+        "INSERT INTO group_jobs (\"group\",job_id,delivery_id,status,attempts) "
+        "VALUES ('a','j1',NULL,'retrying',1)"
+    )
+    conn.commit()
+    conn.close()
+
+    q = JobQueue(Settings(db_path=db, base_backoff=0.0))
+    logger.info(
+        "[输入] 旧库 j1 retrying 且全局 available_at 在 1 小时后 [判定] 回填到 a 组，a 退避中；新建 b 组立即可取"
+    )
+    assert q.claim("a", "c") is None
+    b = q.claim("b", "c2")  # b 组账本 available_at 默认 0，不受 a 组回填的退避影响
+    assert b is not None and b.job_id == "j1"
+    q.close()

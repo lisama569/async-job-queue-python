@@ -11,9 +11,22 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from jobqueue.checkpoint import (
+    checkpoint_from_dict,
+    checkpoint_to_dict,
+    load_checkpoint,
+    save_checkpoint,
+)
 from jobqueue.config import Settings
 from jobqueue.errors import ErrorCode, QueueError
-from jobqueue.models import Delivery, GroupOffset, Job
+from jobqueue.models import (
+    Delivery,
+    GroupCheckpoint,
+    GroupJobView,
+    GroupOffset,
+    GroupProgress,
+    Job,
+)
 from jobqueue.store import JobStore
 
 
@@ -82,6 +95,40 @@ class JobQueue:
 
     def get_offset(self, group: str) -> GroupOffset | None:
         return self.store.get_offset(group)
+
+    # ---------- 进度对账 ----------
+
+    def group_progress(self, group: str) -> GroupProgress:
+        return self.store.group_progress(group)
+
+    def list_group_jobs(self, group: str) -> list[GroupJobView]:
+        return self.store.list_group_jobs(group)
+
+    def get_job_group_views(self, job_id: str) -> list[GroupJobView]:
+        """查询单个任务在各个消费者组里的处理结论。"""
+        return self.store.get_job_group_views(job_id)
+
+    # ---------- 检查点 ----------
+
+    def export_checkpoint(self, group: str) -> GroupCheckpoint:
+        return self.store.export_checkpoint(group)
+
+    def restore_checkpoint(self, checkpoint: GroupCheckpoint) -> GroupProgress:
+        return self.store.restore_checkpoint(checkpoint)
+
+    def save_checkpoint(self, group: str, path: str) -> GroupCheckpoint:
+        checkpoint = self.store.export_checkpoint(group)
+        save_checkpoint(checkpoint, path)
+        return checkpoint
+
+    def load_and_restore_checkpoint(self, path: str) -> GroupProgress:
+        return self.store.restore_checkpoint(load_checkpoint(path))
+
+    def checkpoint_to_dict(self, checkpoint: GroupCheckpoint) -> dict:
+        return checkpoint_to_dict(checkpoint)
+
+    def restore_checkpoint_dict(self, data: dict) -> GroupProgress:
+        return self.store.restore_checkpoint(checkpoint_from_dict(data))
 
     def close(self) -> None:
         if self._owns_store:

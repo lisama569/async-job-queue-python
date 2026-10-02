@@ -42,6 +42,10 @@ def test_commit_offset_must_advance(queue) -> None:
     queue.create_group("g")
     for i in range(3):
         queue.enqueue({"i": i})
+    # 位点必须与处理进度对齐：先确认前两条，才能推进到 2
+    for _ in range(2):
+        d = queue.claim("g", "c1")
+        queue.ack(d.id, "c1")
     queue.commit_offset("g", 1)
     queue.commit_offset("g", 2)
     logger.info("[输入] 位点 2 -> 2（原地）与 2 -> 1（回退）[判定] 均返回 offset_rollback")
@@ -55,7 +59,10 @@ def test_commit_offset_must_advance(queue) -> None:
 def test_commit_offset_out_of_range_rejected(queue) -> None:
     queue.create_group("g")
     queue.enqueue({"i": 1})
-    logger.info("[输入] 只有 1 条任务却提交位点 5 [判定] offset_out_of_range，位点不改变")
+    queue.enqueue({"i": 2})
+    d = queue.claim("g", "c1")
+    queue.ack(d.id, "c1")  # 第 1 条定论；安全位点=1，任务总数=2
+    logger.info("[输入] 队列仅 2 条、安全位点 1，却提交位点 5 [判定] offset_out_of_range，位点不改变")
     with pytest.raises(QueueError) as exc:
         queue.commit_offset("g", 5)
     assert exc.value.code is ErrorCode.OFFSET_OUT_OF_RANGE

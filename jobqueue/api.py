@@ -7,7 +7,11 @@
 - POST   /groups                   注册消费者组
 - GET    /groups                   列出消费者组
 - GET    /groups/{group}/offset    查询位点
-- POST   /groups/{group}/offset    提交位点（只允许严格前进且不越界）
+- POST   /groups/{group}/offset    提交位点（严格前进、不越界、不跳过未定论任务）
+- GET    /groups/{group}/progress  导出该组进度对账（位点 + 五类任务桶 + 安全位点）
+- GET    /groups/{group}/jobs      列出该组每个任务的组内定论
+- GET    /groups/{group}/checkpoint 导出该组检查点快照（JSON）
+- POST   /groups/{group}/checkpoint 依据快照恢复该组进度（换进程续消费）
 - POST   /claim                    占用一条任务
 - POST   /deliveries/{id}/ack      确认成功
 - POST   /deliveries/{id}/nack     否定确认（reason 必填；reject=true 立即拒绝）
@@ -23,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from jobqueue.config import Settings
 from jobqueue.errors import ErrorCode, QueueError
-from jobqueue.models import Delivery, GroupOffset, Job
+from jobqueue.models import Delivery, GroupOffset, GroupProgress, Job
 from jobqueue.queue import JobQueue
 
 router = APIRouter()
@@ -43,6 +47,8 @@ _STATUS: dict[ErrorCode, int] = {
     ErrorCode.UNPROCESSABLE_JOB: 422,
     ErrorCode.OFFSET_ROLLBACK: 409,
     ErrorCode.OFFSET_OUT_OF_RANGE: 409,
+    ErrorCode.OFFSET_GAP: 409,
+    ErrorCode.CHECKPOINT_INVALID: 400,
 }
 
 
@@ -104,6 +110,42 @@ def _delivery_dict(d: Delivery) -> dict[str, Any]:
     }
 
 
+def _group_job_view_dict(v: Any) -> dict[str, Any]:
+    return {
+        "job_id": v.job_id,
+        "group": v.group,
+        "status": v.status.value,
+        "attempts": v.attempts,
+        "delivery_id": v.delivery_id,
+        "terminal": v.status.value in ("succeeded", "failed", "rejected"),
+    }
+
+
+def _progress_dict(p: GroupProgress) -> dict[str, Any]:
+    return {
+        "group": p.group,
+        "offset": p.offset,
+        "safe_offset": p.safe_offset,
+        "total": p.total,
+        "counts": {
+            "succeeded": len(p.succeeded),
+            "failed": len(p.failed),
+            "rejected": len(p.rejected),
+            "inflight": len(p.inflight),
+            "retrying": len(p.retrying),
+            "pending": len(p.pending),
+        },
+        "jobs": {
+            "succeeded": p.succeeded,
+            "failed": p.failed,
+            "rejected": p.rejected,
+            "inflight": p.inflight,
+            "retrying": p.retrying,
+            "pending": p.pending,
+        },
+    }
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     app = FastAPI(title="local-async-job-queue", version="0.1.0")
@@ -135,9 +177,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def get_job(job_id: str) -> dict[str, Any]:
         job = app.state.queue.get_job(job_id)
         deliveries = app.state.queue.list_deliveries(job_id)
+        group_views = app.state.queue.get_job_group_views(job_id)
         return {
             **_job_dict(job),
             "deliveries": [_delivery_dict(d) for d in deliveries],
+            "group_views": [_group_job_view_dict(v) for v in group_views],
         }
 
     @app.post("/groups", status_code=201)
@@ -162,6 +206,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def commit_offset(group: str, body: OffsetBody) -> dict[str, Any]:
         offset = app.state.queue.commit_offset(group, body.offset)
         return {"group": offset.group, "offset": offset.offset}
+
+    @app.get("/groups/{group}/progress")
+    def group_progress(group: str) -> dict[str, Any]:
+        return _progress_dict(app.state.queue.group_progress(group))
+
+    @app.get("/groups/{group}/jobs")
+    def list_group_jobs(group: str) -> dict[str, Any]:
+        views = app.state.queue.list_group_jobs(group)
+        return {"group": group, "jobs": [_group_job_view_dict(v) for v in views]}
+
+    @app.get("/groups/{group}/checkpoint")
+    def export_checkpoint(group: str) -> dict[str, Any]:
+        checkpoint = app.state.queue.export_checkpoint(group)
+        return app.state.queue.checkpoint_to_dict(checkpoint)
+
+    @app.post("/groups/{group}/checkpoint")
+    def restore_checkpoint(group: str, body: dict[str, Any]) -> dict[str, Any]:
+        # 路径 group 必须与快照内 group 一致，避免把 A 组结论恢复进 B 组
+        if body.get("group") != group:
+            raise QueueError(
+                ErrorCode.CHECKPOINT_INVALID,
+                f"路径组 {group!r} 与检查点所属组 {body.get('group')!r} 不一致",
+            )
+        progress = app.state.queue.restore_checkpoint_dict(body)
+        return _progress_dict(progress)
 
     @app.post("/claim")
     def claim(body: ClaimBody) -> JSONResponse:
