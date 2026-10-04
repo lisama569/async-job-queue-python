@@ -136,11 +136,31 @@ class GroupProgress:
 
 
 @dataclass
+class CheckpointJob:
+    """快照中收录的一条任务（让快照自足，可恢复进空队列数据）。"""
+
+    id: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    dedupe_key: str | None = None
+    # 入队顺序由 seq 严格给出（对应导出库 jobs.rowid，从 1 开始）
+    seq: int = 0
+    created_at: float = 0.0
+    max_retries: int = 0
+
+
+@dataclass
 class Checkpoint:
-    """一个组的可持久化进度快照（可落盘为 JSON，供换进程恢复）。"""
+    """一个组的可持久化进度快照（可落盘为 JSON，供换进程恢复）。
+
+    快照自足：除组级位点与终态结论外，还携带导出时队列中的全部任务
+    （id / payload / 去重键 / 入队顺序）。因此即使恢复进一份完全空白的
+    队列数据，该组也能照着快照接着消费。
+    """
 
     group: str
     offset: int
     created_at: float
     # job_id -> 该组内的终态结论（仅收录终态任务）
     conclusions: dict[str, str] = field(default_factory=dict)
+    # 导出时队列中的全部任务，按入队顺序排列
+    jobs: list[CheckpointJob] = field(default_factory=list)

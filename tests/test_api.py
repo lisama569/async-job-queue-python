@@ -134,6 +134,7 @@ def test_progress_checkpoint_restore_over_http(client: TestClient, tmp_path) -> 
     r = client.post("/groups/g/checkpoint", json={"path": path})
     assert r.status_code == 201
     assert r.json()["conclusions"] == {j1["id"]: "succeeded"}
+    assert r.json()["jobs_total"] == 2  # 快照自足：携带全量任务
     r = client.post("/checkpoints/restore", json={"path": path, "group": "g2"})
     logger.info(
         "[输入] HTTP 导出快照并恢复到新组 g2 [判定] g2 位点=1，j1 在 g2 不再投递"

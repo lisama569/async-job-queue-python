@@ -195,6 +195,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "offset": cp.offset,
             "created_at": cp.created_at,
             "conclusions": cp.conclusions,
+            "jobs_total": len(cp.jobs),
             "path": body.path,
         }
 

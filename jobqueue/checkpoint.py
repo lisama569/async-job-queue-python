@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from jobqueue.errors import ErrorCode, QueueError
-from jobqueue.models import TERMINAL_GROUP_STATUSES, Checkpoint
+from jobqueue.models import TERMINAL_GROUP_STATUSES, Checkpoint, CheckpointJob
 
 _FORMAT = "jobqueue-checkpoint"
 _VERSION = 1
@@ -26,20 +26,30 @@ def checkpoint_to_dict(cp: Checkpoint) -> dict[str, Any]:
         "offset": cp.offset,
         "created_at": cp.created_at,
         "conclusions": dict(cp.conclusions),
+        "jobs": [
+            {
+                "id": j.id,
+                "payload": j.payload,
+                "dedupe_key": j.dedupe_key,
+                "seq": j.seq,
+                "created_at": j.created_at,
+                "max_retries": j.max_retries,
+            }
+            for j in cp.jobs
+        ],
     }
+
+
+def _invalid(msg: str) -> QueueError:
+    return QueueError(ErrorCode.CHECKPOINT_INVALID, msg)
 
 
 def checkpoint_from_dict(data: Any) -> Checkpoint:
     """解析并校验快照字典；结构非法抛 checkpoint_invalid。"""
     if not isinstance(data, dict) or data.get("format") != _FORMAT:
-        raise QueueError(
-            ErrorCode.CHECKPOINT_INVALID, "不是有效的 jobqueue 检查点文档"
-        )
+        raise _invalid("不是有效的 jobqueue 检查点文档")
     if data.get("version") != _VERSION:
-        raise QueueError(
-            ErrorCode.CHECKPOINT_INVALID,
-            f"不支持的检查点版本：{data.get('version')!r}",
-        )
+        raise _invalid(f"不支持的检查点版本：{data.get('version')!r}")
     group = data.get("group")
     offset = data.get("offset")
     conclusions = data.get("conclusions")
@@ -47,6 +57,7 @@ def checkpoint_from_dict(data: Any) -> Checkpoint:
         not isinstance(group, str)
         or not group
         or not isinstance(offset, int)
+        or isinstance(offset, bool)
         or offset < 0
         or not isinstance(conclusions, dict)
         or not all(
@@ -54,15 +65,71 @@ def checkpoint_from_dict(data: Any) -> Checkpoint:
             for k, v in conclusions.items()
         )
     ):
-        raise QueueError(
-            ErrorCode.CHECKPOINT_INVALID,
-            "检查点字段缺失或非法（group/offset/conclusions）",
-        )
+        raise _invalid("检查点字段缺失或非法（group/offset/conclusions）")
+
+    raw_jobs = data.get("jobs", [])
+    jobs: list[CheckpointJob] = []
+    seen_ids: set[str] = set()
+    seen_seqs: set[int] = set()
+    # 旧版快照没有 jobs 字段：仍可解析，但只能恢复进包含这些任务的队列
+    if "jobs" in data and not isinstance(raw_jobs, list):
+        raise _invalid("检查点 jobs 字段必须是数组")
+    if raw_jobs:
+        for item in raw_jobs:
+            if not isinstance(item, dict):
+                raise _invalid("检查点 jobs 中的任务记录必须是对象")
+            job_id = item.get("id")
+            payload = item.get("payload")
+            dedupe_key = item.get("dedupe_key")
+            seq = item.get("seq")
+            created_at = item.get("created_at", 0.0)
+            max_retries = item.get("max_retries", 0)
+            if (
+                not isinstance(job_id, str)
+                or not job_id
+                or not isinstance(payload, dict)
+                or not (dedupe_key is None or isinstance(dedupe_key, str))
+                or not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or seq <= 0
+                or not isinstance(created_at, (int, float))
+                or isinstance(created_at, bool)
+                or not isinstance(max_retries, int)
+                or isinstance(max_retries, bool)
+                or max_retries < 0
+            ):
+                raise _invalid(
+                    "检查点 jobs 中存在字段缺失或非法的任务记录"
+                    f"（job_id={job_id!r}）"
+                )
+            if job_id in seen_ids:
+                raise _invalid(f"检查点 jobs 中任务 id 重复：{job_id}")
+            if seq in seen_seqs:
+                raise _invalid(f"检查点 jobs 中入队序号 seq 重复：{seq}")
+            seen_ids.add(job_id)
+            seen_seqs.add(seq)
+            jobs.append(
+                CheckpointJob(
+                    id=job_id,
+                    payload=payload,
+                    dedupe_key=dedupe_key,
+                    seq=seq,
+                    created_at=float(created_at),
+                    max_retries=max_retries,
+                )
+            )
+        missing = [jid for jid in conclusions if jid not in seen_ids]
+        if missing:
+            raise _invalid(
+                f"检查点终态结论引用了 jobs 中不存在的任务：{missing[:3]}"
+                f"（共 {len(missing)} 条）"
+            )
     return Checkpoint(
         group=group,
         offset=offset,
         created_at=float(data.get("created_at", 0.0)),
         conclusions=dict(conclusions),
+        jobs=jobs,
     )
 
 

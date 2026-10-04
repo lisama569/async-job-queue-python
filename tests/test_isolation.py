@@ -87,6 +87,55 @@ def test_backoff_does_not_block_other_groups(settings) -> None:
     queue.close()
 
 
+def test_terminal_state_locked_when_another_group_is_inflight(queue) -> None:
+    """任一组给出终态后，其它组的领取 / 失败重试 / 确认都不会改回全局状态。"""
+    job = queue.enqueue({"n": 1})
+    da = queue.claim("A", "c1")
+    queue.ack(da.id, "c1")  # A 组 succeeded -> 全局终态锁定
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED
+    logger.info(
+        "[输入] A 组已 succeeded；B 组 claim -> nack 退避 -> 超时回收 -> 再 claim "
+        "-> 重试耗尽 failed [判定] 全局状态始终为 succeeded，A 组结论仍可分别查到"
+    )
+    db = queue.claim("B", "c2")
+    assert db is not None
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED  # 不退回 inflight
+    queue.nack(db.id, "c2", "瞬时故障")
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED  # 不退回 retrying
+    # 等 B 组占用超时回收并重试耗尽
+    deadline = time.time() + 5
+    while True:
+        d = queue.claim("B", "c2")
+        if d is not None:
+            queue.nack(d.id, "c2", "持续故障")
+        st = queue.job_group_statuses(job.id).get("B")
+        if st == "failed":
+            break
+        assert time.time() < deadline, "B 组未能推进到 failed"
+        time.sleep(0.02)
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED  # B failed 也不改写
+    statuses = queue.job_group_statuses(job.id)
+    assert statuses == {"A": "succeeded", "B": "failed"}
+
+
+def test_rejected_terminal_state_locked_by_other_group_actions(queue) -> None:
+    """A 组 rejected 终态后，B 组在途期间全局状态保持 rejected。"""
+    job = queue.enqueue({"n": 1})
+    da = queue.claim("A", "c1")
+    queue.nack(da.id, "c1", "内容非法", unprocessable=True)
+    assert queue.get_job(job.id).state is JobState.REJECTED
+    logger.info(
+        "[输入] A 组 rejected 后 B 组领取并在途、再退避 [判定] 全局状态保持 rejected，"
+        "B 组结论单独记录为 inflight/retrying"
+    )
+    db = queue.claim("B", "c2")
+    assert db is not None
+    assert queue.get_job(job.id).state is JobState.REJECTED
+    queue.nack(db.id, "c2", "B 的故障")
+    assert queue.get_job(job.id).state is JobState.REJECTED
+    assert queue.job_group_statuses(job.id) == {"A": "rejected", "B": "retrying"}
+
+
 def test_job_query_shows_per_group_conclusions(queue) -> None:
     job = queue.enqueue({"n": 1})
     da = queue.claim("A", "c1")
