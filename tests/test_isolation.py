@@ -59,6 +59,59 @@ def test_failed_conclusion_not_reverted_by_other_groups(settings) -> None:
     queue.close()
 
 
+def test_global_state_locked_once_any_group_terminal(queue) -> None:
+    """任一组合格后，全局任务状态锁定终态，其它组领取/重试/确认都不改回。"""
+    job = queue.enqueue({"n": 1})
+    da = queue.claim("A", "c1")
+    queue.ack(da.id, "c1")
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED
+    logger.info(
+        "[输入] A 组 succeeded 后，B 组依次 claim（在途）-> nack（退避）"
+        "-> 超时回收 -> 再 claim -> ack "
+        "[判定] 全局状态全程保持 succeeded，不退回 inflight/retrying；"
+        "A、B 两组各自结论仍可分别查到"
+    )
+    db = queue.claim("B", "c2")
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED  # 领取不改回
+    queue.nack(db.id, "c2", "B 瞬时故障")
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED  # 失败重试不改回
+    # B 组退避到期后再次领取并确认，全局仍是终态
+    time.sleep(0.02)
+    db2 = queue.claim("B", "c2")
+    assert db2 is not None
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED  # 再次领取不改回
+    queue.ack(db2.id, "c2")
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED
+    statuses = queue.job_group_statuses(job.id)
+    assert statuses["A"] == "succeeded" and statuses["B"] == "succeeded"
+
+
+def test_global_terminal_priority_without_reverting(settings) -> None:
+    """failed/rejected 定论后也锁定；后续更优结论可按优先级提升但不回退。"""
+    queue = JobQueue(replace(settings, base_backoff=0.0))
+    job = queue.enqueue({"n": 1})
+    for _ in range(4):  # A 组重试耗尽 -> failed
+        d = queue.claim("A", "c1")
+        queue.nack(d.id, "c1", "故障")
+    assert queue.get_job(job.id).state is JobState.FAILED
+    logger.info(
+        "[输入] A 组 failed 后 B 组领取在途，随后 reject，再由 C 组 ack "
+        "[判定] B 在途时全局仍为 failed（不退回在途）；B reject 后升级为 rejected；"
+        "C ack 后升级为 succeeded，全程不出现非终态"
+    )
+    db = queue.claim("B", "c2")
+    assert queue.get_job(job.id).state is JobState.FAILED
+    queue.nack(db.id, "c2", "不可处理", unprocessable=True)
+    assert queue.get_job(job.id).state is JobState.REJECTED
+    dc = queue.claim("C", "c3")
+    assert queue.get_job(job.id).state is JobState.REJECTED
+    queue.ack(dc.id, "c3")
+    assert queue.get_job(job.id).state is JobState.SUCCEEDED
+    statuses = queue.job_group_statuses(job.id)
+    assert statuses == {"A": "failed", "B": "rejected", "C": "succeeded"}
+    queue.close()
+
+
 def test_backoff_does_not_block_other_groups(settings) -> None:
     queue = JobQueue(
         replace(settings, base_backoff=60.0, backoff_cap=60.0, jitter=0.0)

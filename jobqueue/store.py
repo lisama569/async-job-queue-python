@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -19,6 +20,7 @@ from jobqueue.errors import ErrorCode, QueueError
 from jobqueue.models import (
     TERMINAL_GROUP_STATUSES,
     Checkpoint,
+    CheckpointJob,
     Delivery,
     GroupOffset,
     GroupProgress,
@@ -65,6 +67,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS idx_group_jobs_group ON group_jobs("group");
 CREATE INDEX IF NOT EXISTS idx_deliveries_group ON deliveries("group", state);
 """
+
+logger = logging.getLogger("jobqueue.store")
 
 
 class JobStore:
@@ -132,8 +136,10 @@ class JobStore:
     ) -> None:
         """根据所有组的分发状态汇总任务全局状态。
 
-        优先级：存在未终结的组 -> inflight/retrying（有 active 则 inflight）；
-        全部终结 -> 任一组 succeeded 即 succeeded；否则 rejected 优先于 failed。
+        终态锁定：只要任一组已给出终态结论，全局状态就保持终态
+        （succeeded 优先于 rejected 优先于 failed），其它组后续的
+        领取 / 重试 / 确认不会再把它改回在途或待处理；
+        尚无任何组定论时才呈现 inflight / retrying / pending。
         """
         row = conn.execute(
             "SELECT "
@@ -148,26 +154,30 @@ class JobStore:
         ).fetchone()
         if row is None or row["total"] == 0:
             state = JobState.PENDING.value
-        elif row["inflight_n"]:
-            state = JobState.INFLIGHT.value
-        elif row["retrying_n"]:
-            state = JobState.RETRYING.value
         elif row["ok_n"]:
+            # 任一组成功：任务对外即成功，且不被其它组动作改回
             state = JobState.SUCCEEDED.value
         elif row["rej_n"]:
             state = JobState.REJECTED.value
         elif row["fail_n"]:
             state = JobState.FAILED.value
+        elif row["inflight_n"]:
+            state = JobState.INFLIGHT.value
+        elif row["retrying_n"]:
+            state = JobState.RETRYING.value
         else:
             state = JobState.PENDING.value
         conn.execute(
             "UPDATE jobs SET state=?, attempts=COALESCE(("
             "SELECT MAX(attempts) FROM group_jobs WHERE job_id=?), 0), "
-            "available_at=COALESCE(("
+            "available_at=CASE WHEN COALESCE(("
+            "SELECT COUNT(*) FROM group_jobs WHERE job_id=? "
+            "AND status IN ('succeeded','failed','rejected')), 0) > 0 THEN 0 "
+            "ELSE COALESCE(("
             "SELECT MIN(available_at) FROM group_jobs WHERE job_id=? "
-            "AND status IN ('pending','retrying','inflight')), 0), "
+            "AND status IN ('pending','retrying','inflight')), 0) END, "
             "updated_at=? WHERE id=?",
-            (state, job_id, job_id, now, job_id),
+            (state, job_id, job_id, job_id, now, job_id),
         )
 
     def _row_to_job(self, row: sqlite3.Row) -> Job:
@@ -664,17 +674,32 @@ class JobStore:
     # ---------- 检查点（进度快照） ----------
 
     def export_checkpoint(self, group: str) -> Checkpoint:
-        """导出某组当前的进度快照：位点 + 该组内所有终态结论。"""
+        """导出某组当前的进度快照：位点 + 该组所有终态结论 + 队列全量任务。
+
+        收录全量任务（按入队顺序）使快照自足：换消费进程、甚至恢复进一份
+        空队列数据，也能照单重建任务后接着消费。
+        """
         progress = self.group_progress(group)
         conclusions: dict[str, str] = {}
         for status in sorted(TERMINAL_GROUP_STATUSES):
             for job_id in progress.buckets.get(status, []):
                 conclusions[job_id] = status
+        jobs = [
+            CheckpointJob(
+                id=j.id,
+                dedupe_key=j.dedupe_key,
+                payload=j.payload,
+                max_retries=j.max_retries,
+                created_at=j.created_at,
+            )
+            for j in self.list_jobs()
+        ]
         return Checkpoint(
             group=group,
             offset=progress.offset,
             created_at=self._now(),
             conclusions=conclusions,
+            jobs=jobs,
         )
 
     def restore_checkpoint(
@@ -682,11 +707,20 @@ class JobStore:
     ) -> GroupOffset:
         """把快照恢复到指定组（默认快照原组名），供重启/换进程后接着消费。
 
-        - 快照中的终态结论写入目标组：已定论任务不会再被投递；
-        - 快照未收录的任务保持 pending，不会被跳过；
-        - 目标组已有不同终态结论时拒绝（checkpoint_conflict），不覆盖；
-        - 位点只前进不回退：取当前位点与快照位点的较大者；
-        - 只写目标组的账本，其它组不受影响。
+        快照自足：v2 快照收录了导出时的全部任务，恢复时会把目标队列缺失的
+        任务按入队顺序物料化，因此换一个消费进程、甚至恢复进一份空队列数据
+        也能接上：
+        - 快照中的终态结论写入目标组——已定论任务不会再被投递执行；
+          目标组此前若有未确认的在途投递，统一标记为 timed_out，
+          旧消费者的迟到确认不会推翻快照结论；
+        - 快照未定论的任务（含物料化进来的任务）在目标组保持 pending，
+          不会被跳过、也不会丢失；
+        - 只写目标组的账本，其它组的进度不受影响；
+        - 恢复后的位点与该组真实进度严格对齐：不回退（不低于当前位点）、
+          不超前（不超过按入队顺序的终态前缀长度，也不超过队列任务总数）。
+          快照位点虚高时自动纠正到真实可支撑的位置并记录日志；
+        - 目标组已有不同终态结论、或快照任务与库内任务身份冲突
+          （dedupe_key 被别的任务占用）时整体拒绝（不落任何修改）。
         """
         target = group or checkpoint.group
         if not target:
@@ -697,6 +731,7 @@ class JobStore:
                     ErrorCode.CHECKPOINT_INVALID,
                     f"检查点含非终态结论：job={job_id} status={status!r}",
                 )
+        cp_jobs: dict[str, CheckpointJob] = {j.id: j for j in checkpoint.jobs}
         now = self._now()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -707,61 +742,144 @@ class JobStore:
                     "ON CONFLICT(name) DO NOTHING",
                     (target,),
                 )
-                unknown = [
+                # 结论引用的任务要么在快照 jobs 中（可物料化），
+                # 要么已存在于目标库（v1 快照向后兼容）；两者皆无则无法恢复
+                unsatisfiable = [
                     job_id
                     for job_id in checkpoint.conclusions
-                    if conn.execute(
+                    if job_id not in cp_jobs
+                    and conn.execute(
                         "SELECT 1 FROM jobs WHERE id=?", (job_id,)
                     ).fetchone()
                     is None
                 ]
-                if unknown:
+                if unsatisfiable:
                     raise QueueError(
                         ErrorCode.CHECKPOINT_INVALID,
-                        f"检查点引用了队列中不存在的任务：{unknown[:3]}"
-                        f"（共 {len(unknown)} 条）",
+                        f"检查点不自足：结论引用的任务 {unsatisfiable[:3]}"
+                        f"（共 {len(unsatisfiable)} 条）既未收录在快照 jobs 中，"
+                        "也不存在于目标队列，无法恢复进新队列数据",
                     )
+                materialized: list[str] = []
+                for j in checkpoint.jobs:
+                    existing = conn.execute(
+                        "SELECT id, dedupe_key FROM jobs WHERE id=?", (j.id,)
+                    ).fetchone()
+                    if existing is not None:
+                        # id 已存在：dedupe_key 必须一致，否则是同名不同任务
+                        if existing["dedupe_key"] != j.dedupe_key:
+                            raise QueueError(
+                                ErrorCode.CHECKPOINT_INVALID,
+                                f"检查点任务 {j.id} 与库内任务身份冲突："
+                                f"快照 dedupe_key={j.dedupe_key!r}，"
+                                f"库内={existing['dedupe_key']!r}",
+                            )
+                        continue
+                    if j.dedupe_key is not None:
+                        clash = conn.execute(
+                            "SELECT id FROM jobs WHERE dedupe_key=?",
+                            (j.dedupe_key,),
+                        ).fetchone()
+                        if clash is not None:
+                            raise QueueError(
+                                ErrorCode.CHECKPOINT_INVALID,
+                                f"检查点任务 {j.id} 的 dedupe_key="
+                                f"{j.dedupe_key!r} 已被库内任务 {clash['id']} 占用",
+                            )
+                    body = json.dumps(j.payload, ensure_ascii=False, sort_keys=True)
+                    conn.execute(
+                        "INSERT INTO jobs (id, dedupe_key, payload, state, attempts, "
+                        "max_retries, available_at, last_error, created_at, "
+                        "updated_at) VALUES (?,?,?,?,'pending',0,?,NULL,?,?)",
+                        (
+                            j.id,
+                            j.dedupe_key,
+                            body,
+                            JobState.PENDING.value,
+                            j.max_retries,
+                            j.created_at,
+                            now,
+                        ),
+                    )
+                    materialized.append(j.id)
+                # 目标组补齐全部任务的账本（含刚物料化进来的任务）
+                self._backfill_group_jobs(conn, target)
+
                 conflicts: list[str] = []
-                changed: list[str] = []
+                decided: list[str] = []
                 for job_id, status in checkpoint.conclusions.items():
                     row = conn.execute(
-                        "SELECT status FROM group_jobs "
+                        "SELECT status, delivery_id FROM group_jobs "
                         "WHERE \"group\"=? AND job_id=?",
                         (target, job_id),
                     ).fetchone()
-                    if row is None:
-                        conn.execute(
-                            "INSERT INTO group_jobs "
-                            "(\"group\", job_id, delivery_id, status) "
-                            "VALUES (?,?,NULL,?)",
-                            (target, job_id, status),
+                    if row is None:  # 理论不会发生：上面已 backfill
+                        raise QueueError(
+                            ErrorCode.CHECKPOINT_INVALID,
+                            f"检查点引用了队列中不存在的任务：{job_id}",
                         )
-                        changed.append(job_id)
-                    elif row["status"] in TERMINAL_GROUP_STATUSES:
+                    if row["status"] in TERMINAL_GROUP_STATUSES:
                         if row["status"] != status:
                             conflicts.append(
                                 f"{job_id}: 现有={row['status']} 快照={status}"
                             )
-                    else:
+                        continue
+                    # 目标组此前若有在途/退避账本，快照结论接管：
+                    # 未确认的旧投递一律视为超时回收，杜绝迟到确认翻回状态
+                    if row["delivery_id"] is not None:
                         conn.execute(
-                            "UPDATE group_jobs SET delivery_id=NULL, status=?, "
-                            "available_at=0 WHERE \"group\"=? AND job_id=?",
-                            (status, target, job_id),
+                            "UPDATE deliveries SET state='timed_out' "
+                            "WHERE id=? AND state='active'",
+                            (row["delivery_id"],),
                         )
-                        changed.append(job_id)
+                    conn.execute(
+                        "UPDATE group_jobs SET delivery_id=NULL, status=?, "
+                        "available_at=0 WHERE \"group\"=? AND job_id=?",
+                        (status, target, job_id),
+                    )
+                    decided.append(job_id)
                 if conflicts:
                     raise QueueError(
                         ErrorCode.CHECKPOINT_CONFLICT,
                         f"检查点与组 {target!r} 现有终态结论冲突：{conflicts[:3]}"
                         f"（共 {len(conflicts)} 条），未做任何修改",
                     )
-                for job_id in changed:
+                for job_id in materialized:
                     self._rollup_job(conn, job_id, now)
-                # 位点只前进不回退
-                row = conn.execute(
+                for job_id in decided:
+                    self._rollup_job(conn, job_id, now)
+
+                # 位点与该组真实进度对齐：
+                # 计算按入队顺序的最长终态前缀（恢复后的真实可支撑位点）
+                prefix_rows = conn.execute(
+                    "SELECT gj.status AS st FROM jobs j "
+                    "JOIN group_jobs gj ON gj.job_id=j.id AND gj.\"group\"=? "
+                    "ORDER BY j.created_at, j.rowid",
+                    (target,),
+                ).fetchall()
+                supported = 0
+                for r in prefix_rows:
+                    if r["st"] not in TERMINAL_GROUP_STATUSES:
+                        break
+                    supported += 1
+                total = len(prefix_rows)
+                cur = conn.execute(
                     "SELECT \"offset\" FROM groups WHERE name=?", (target,)
-                ).fetchone()
-                new_offset = max(row["offset"], checkpoint.offset)
+                ).fetchone()["offset"]
+                requested = max(cur, checkpoint.offset)
+                if checkpoint.offset > total:
+                    logger.warning(
+                        "[检查点纠正] group=%s 快照位点=%s 超过队列任务总数=%s，"
+                        "拒绝超前，恢复位点纠正为 %s",
+                        target, checkpoint.offset, total, supported,
+                    )
+                elif requested > supported:
+                    logger.warning(
+                        "[检查点纠正] group=%s 快照位点=%s 虚高：前 %s 条任务中"
+                        "仅 %s 条有终态结论，恢复位点纠正为 %s",
+                        target, checkpoint.offset, total, supported, supported,
+                    )
+                new_offset = min(requested, supported)
                 conn.execute(
                     "UPDATE groups SET \"offset\"=? WHERE name=?",
                     (new_offset, target),

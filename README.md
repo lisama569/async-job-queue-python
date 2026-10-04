@@ -8,8 +8,9 @@
 - 位点（offset）管理：只能严格前进，回退 / 原地提交 / 越界 / 跳过未定论任务
   一律明确拒绝，位点始终与组内实际处理进度对齐
 - 进度对账：按组导出位点 + 各状态（成功/失败/拒绝/在途/待处理/退避中）任务清单
-- 检查点：组进度可导出为 JSON 快照，重启或换消费进程后据此接着消费，
-  已定论任务不重做、未做完任务不跳过、其它组不受影响
+- 检查点：组进度导出为**自足** JSON 快照（v2，含全量任务），重启、换消费进程
+  甚至恢复进空队列数据都能据此接着消费，已定论任务不重做、未做完任务不跳过、
+  其它组不受影响；恢复位点自动与该组真实进度对齐（虚高/越界会被纠正）
 - at-least-once 投递 + 占用超时自动回收重投 + 可控指数退避重试（退避按组隔离）
 - 同一任务在同一组内同一时刻只能被一个消费者占用
 - 超过重试上限 → `failed` 终态；内容不可处理 → `rejected` 终态；均可查询原因
@@ -21,7 +22,7 @@
 uv sync                                   # 安装依赖（含 pytest / httpx）
 uv run python -m jobqueue.cli demo        # 端到端演示：成功 / 重试耗尽 / 拒绝
 uv run python -m jobqueue.cli serve       # 启动 HTTP 服务（默认 127.0.0.1:8000）
-uv run pytest -q                          # 运行全部测试（58 个，含并发/重启/检查点边界）
+uv run pytest -q                          # 运行全部测试（72 个，含并发/重启/检查点边界）
 ```
 
 ## HTTP API
@@ -69,11 +70,13 @@ curl -s -XPOST localhost:8000/deliveries/1/ack -H 'content-type: application/jso
   无法处理，立即进入 `rejected` 终态；其它异常进入重试，超限后进入 `failed` 终态。
   `last_error` 始终落盘，可通过 `GET /jobs/{id}` 区分失败原因。
 - **组间独立**：每个组对每个任务各有一份投递账本（`group_jobs`），A 组占用 / 失败
-  不影响 B 组消费；`jobs.state` 是所有组分发状态的汇总视图
-  （有 inflight → inflight；有 retrying → retrying；全终态时 succeeded 优先于
-  rejected 优先于 failed）。
+  不影响 B 组消费；任务对外的全局 `jobs.state` 是所有组分发状态的汇总视图。
 - **终态不被改回**：某组对任务一旦得出终态结论（succeeded / failed / rejected），
-  其它组的投递、确认、重试都只写自己的账本，不会把该组的结论改回在途或待处理。
+  全局状态即**锁定在终态**——其它组随后的领取（claim）、失败重试（nack/超时回收）
+  或确认都只写自己的账本，不会再把全局状态改回 inflight / retrying / pending。
+  存在多个终态结论时按 succeeded 优先于 rejected 优先于 failed 汇总（后续更优
+  结论可以提升全局状态，但不会回落到非终态）；各组自己的结论始终可通过
+  `GET /jobs/{id}` 的 `groups` 字段分别查询。
 - **退避按组隔离**：失败后的退避等待时间记录在 `group_jobs.available_at`（组级），
   A 组退避只挡住 A 组自己对该任务的投递，B 组照常取件、按自己的节奏推进。
 - **按组查询结论**：`GET /jobs/{id}` 的 `groups` 字段（或库接口
@@ -151,20 +154,35 @@ curl -s -XPOST localhost:8000/deliveries/1/ack -H 'content-type: application/jso
 ### 检查点（checkpoint）
 
 - **导出**：`POST /groups/{g}/checkpoint`（库接口
-  `queue.export_checkpoint(g, path)`）把该组当前对账结果固化为一份自描述的
-  JSON 快照（位点 + 该组所有终态结论），给定 `path` 时原子落盘
-  （先写临时文件再改名）。
+  `queue.export_checkpoint(g, path)`）把该组当前对账结果固化为一份**自足的**
+  JSON 快照（v2：位点 + 该组所有终态结论 + 导出时队列内的**全部任务**，
+  按入队顺序收录，含 `id / dedupe_key / payload / max_retries / created_at`），
+  给定 `path` 时原子落盘（先写临时文件再改名）。
 - **恢复**：`POST /checkpoints/restore`（库接口
   `queue.restore_checkpoint(path_or_cp, group=None)`）把快照应用到目标组
-  （默认快照原组名，可改名，用于换消费进程接管）：
+  （默认快照原组名，可改名，用于换消费进程接管）。**快照可以跨进程、
+  甚至恢复进一份完全空的队列数据**——恢复时会把目标库缺失的快照任务照单
+  物料化（保持入队顺序与原 id / dedupe_key）：
   - 快照中的终态结论写入目标组账本——已定论任务**不会再被投递执行**；
-  - 快照未收录的任务保持 pending——**不会被跳过**，照常按序投递；
-  - 只写目标组的账本，**其它组的进度不受影响**；
-  - 位点只前进不回退：取当前位点与快照位点的较大者；
-  - 目标组已有**不同**终态结论时整体拒绝（`409 checkpoint_conflict`，不落任何
-    修改）；快照文件损坏、格式不符或引用了队列中不存在的任务时返回
-    `400 checkpoint_invalid`；
-  - 恢复是幂等的：同一快照重复恢复结果一致。
+    目标组此前若有未确认的在途投递，恢复时统一接管为 `timed_out`，
+    旧消费者之后的迟到 ack/nack 会被投递账本拒绝，无法把快照结论翻回在途；
+  - 快照未定论的任务（包括导出时在途 / 退避 / 未投递的）在目标组统一保持
+    pending——**不会被跳过也不会丢失**，恢复后照常按序 claim；
+  - 只写目标组的账本，**其它组的进度不受影响**（目标库中原有的任务和组
+    也原样保留；接管组按"新组可见历史任务"的惰性规则同样能看到它们）；
+  - **恢复位点与该组真实进度严格对齐**：恢复位点 = 夹取后的
+    `min(max(当前位点, 快照位点), 恢复后按入队顺序的终态前缀长度)`，
+    因此它不回退、不超前、也不可能超过当前队列任务总数。快照位点虚高
+    （比如实际只对账到 1 条却记成 3）时会被**自动纠正**到真实能支撑的
+    位置，并在服务日志中留下 `[检查点纠正]` 记录，绝不留下
+    "位点显示处理到后面、前面其实还没结果"的状态；
+  - 目标组已有**不同**终态结论时整体拒绝（`409 checkpoint_conflict`，不落
+    任何修改）；快照结构非法、结论引用了 jobs 与目标库中都不存在的任务、
+    或快照任务与库内任务身份冲突（同 id 不同 dedupe_key，或 dedupe_key
+    被别的任务占用）时返回 `400 checkpoint_invalid`；
+  - 恢复是幂等的：同一快照重复恢复结果一致；
+  - 旧版 v1 快照（只有结论、不含 jobs）仍可读取与恢复，但只能恢复进
+    已包含其所引任务的队列数据；新导出的快照一律为自足的 v2。
 - 恢复后原有的至少一次投递、占用超时重投语义不变：快照只标记"已定论"，
   在途 / 待处理任务仍走正常的 claim → ack/nack → 超时回收流程。
 
@@ -214,8 +232,33 @@ curl -s -XPOST localhost:8000/deliveries/1/ack -H 'content-type: application/jso
 - **退避语义修正**：失败退避由全局（`jobs.available_at`）改为组级
   （`group_jobs.available_at`），某组退避不再拖住其它组；`jobs.available_at`
   仍维护为各组未终结账本的最小值，仅作汇总展示。
-- 检查点快照为自描述 JSON（`format=jobqueue-checkpoint, version=1`），
-  可跨进程、跨机器搬运；恢复目标必须是包含快照所引任务的同一队列数据。
+- 检查点快照为自描述 JSON（`format=jobqueue-checkpoint`）。当前导出 **version=2**：
+  除位点与终态结论外还收录导出时的全部任务，**可跨进程、跨机器搬运，也能恢复进
+  一份空的队列数据**（任务照单重建后续跑）；version=1 的旧快照仍可读取，
+  但只能恢复进已包含其所引任务的队列数据。
+
+## 本地验证
+
+```bash
+uv sync                                   # 安装依赖（含 pytest / httpx）
+uv run pytest -q                          # 全部单测（72 个）
+uv run pytest --log-cli-level=INFO -q     # 查看每条用例的 [输入] / [判定] 依据
+uv run pytest tests/test_isolation.py tests/test_checkpoint.py -q   # 仅本轮修复相关
+uv run python -m jobqueue.cli demo        # 端到端冒烟演示
+```
+
+跨进程 / 空库续跑可手动验证：
+
+```python
+from jobqueue.config import Settings
+from jobqueue.queue import JobQueue
+
+q1 = JobQueue(Settings(db_path="a.db"))   # 进程 A：消费到一半后导出
+q1.export_checkpoint("g", "snapshot.json")
+q2 = JobQueue(Settings(db_path="fresh.db"))  # 进程 B、空队列数据
+q2.restore_checkpoint("snapshot.json")    # 任务照单重建，定论不重做、未完成不跳过
+# q2.claim("g", ...) 接着消费即可；恢复位点已与该组真实进度对齐
+```
 
 ## 在代码中作为库使用
 
@@ -246,10 +289,16 @@ Worker(queue, "emails", "worker-1", send_email).run()
 - 组间独立、新组看历史、位点回退 / 越界 / 未知组拒绝（`tests/test_groups.py`）
 - 进度对账分桶、位点跳过在途/退避/未投递任务的 `offset_gap` 拒绝
   （`tests/test_reconcile.py`）
-- 组间隔离：终态不被其它组改回、退避互不牵连、按组查看任务结论
-  （`tests/test_isolation.py`）
+- 组间隔离：终态不被其它组改回（含全局状态锁定）、退避互不牵连、
+  按组查看任务结论（`tests/test_isolation.py`）
 - 检查点导出 / 落盘 / 恢复：重启接着消费、换组接管、冲突与非法快照拒绝、
   位点只前进、幂等恢复（`tests/test_checkpoint.py`）
+- 自足快照（v2）：恢复进空队列数据后任务照单重建、定论不重做、未完成不丢失，
+  恢复进另一进程的已有库不影响其本地组；在途旧投递被接管后迟到确认无效；
+  v1 旧快照向后兼容；dedupe_key 身份冲突拒绝（`tests/test_checkpoint.py`）
+- 恢复位点对齐：快照位点虚高（只定论 1 条记 3）纠正为真实终态前缀、
+  位点越界（超过任务总数）夹回、零定论纠正到 0、如实位点不被压低
+  （`tests/test_checkpoint.py`）
 - 进程重启恢复、崩溃后超时重投、终态不复活（`tests/test_restart.py`）
 - 8 消费者并发 claim 每任务仅一次、4 worker 并发含永久失败、位点并发竞争
   （`tests/test_concurrency.py`）

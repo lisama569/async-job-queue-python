@@ -136,6 +136,17 @@ class GroupProgress:
 
 
 @dataclass
+class CheckpointJob:
+    """快照收录的一条任务（足以在空队列数据上把它重建出来）。"""
+
+    id: str
+    dedupe_key: str | None
+    payload: dict[str, Any] = field(default_factory=dict)
+    max_retries: int = 0
+    created_at: float = 0.0
+
+
+@dataclass
 class Checkpoint:
     """一个组的可持久化进度快照（可落盘为 JSON，供换进程恢复）。"""
 
@@ -144,3 +155,6 @@ class Checkpoint:
     created_at: float
     # job_id -> 该组内的终态结论（仅收录终态任务）
     conclusions: dict[str, str] = field(default_factory=dict)
+    # 导出时队列内的全部任务（按入队顺序），保证快照自足：
+    # 换进程 / 恢复进空队列数据时也能照单重建，未完成任务不丢失
+    jobs: list[CheckpointJob] = field(default_factory=list)
